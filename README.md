@@ -1,7 +1,7 @@
 # Embedded Fire Detection and Room Occupancy Monitoring System
 
 A two-board embedded system built on **Zephyr RTOS 4.2.1** and the **Raspberry Pi Pico 2 (RP2350A, Cortex-M33)**.
-A *sensor node* fuses four sensors (air quality, infrared object temperature, mmWave presence, and a microphone)
+A *sensor node* collects readings from four sensors (air quality, infrared object temperature, mmWave presence, and a microphone)
 into a byte-addressable register map and serves it as an **I2C target device** with a hardware interrupt line.
 A *base station* reads that register map through a custom Zephyr sensor driver, drives a buzzer and NeoPixel
 alarm on an object-temperature interrupt, and exposes an interactive UART configuration menu.
@@ -34,38 +34,21 @@ with the full upstream commit history preserved. See [Team and attribution](#tea
 ## System architecture
 
 ```mermaid
-flowchart LR
-    subgraph SN["Sensor node — Pico 2, Zephyr"]
-        direction TB
-        S1["BME680<br/>air temp · humidity · gas"]
-        S2["MLX90614<br/>IR object temp"]
-        S3["HMMD mmWave<br/>presence · range"]
-        S4["SPW2430 mic<br/>peak · RMS"]
-        RM["Register map<br/>256 B, spinlock-guarded"]
-        S1 -- "I2C0 · 0x77" --> RM
-        S2 -- "I2C0 · 0x5A" --> RM
-        S3 -- "UART1 · 115200" --> RM
-        S4 -- "ADC0" --> RM
+flowchart TB
+    subgraph NODE["Sensor node · Pico 2"]
+        S["BME680 · MLX90614 · mmWave · mic"] --> RM["Register map<br/>I2C target 0x42 + INT pin"]
     end
-
-    subgraph BS["Base station — Pico 2, Zephyr"]
-        direction TB
-        DRV["remote_pico<br/>Zephyr sensor driver"]
-        LOOP["Poll loop · 1 s<br/>console snapshot"]
-        IRQW["Interrupt work item<br/>T_OBJ_HIGH"]
-        ALARM["Fire alarm<br/>buzzer + NeoPixel"]
-        CFG["Configuration mode<br/>UART menu, GP20 button"]
-        DRV --> LOOP
-        DRV --> IRQW --> ALARM
-        CFG --> DRV
+    subgraph BASE["Base station · Pico 2"]
+        DRV["remote_pico driver<br/>76-byte burst read"] --> POLL["1 s poll<br/>console snapshot"]
+        IRQ["INT handler"] --> ALARM["Fire alarm<br/>buzzer + NeoPixel"]
+        CFG["Config menu<br/>UART + button"] --> DRV
     end
-
-    RM -- "I2C target 0x42<br/>GP6 SDA · GP7 SCL" --> DRV
-    RM -- "INT line<br/>GP16 → GP16" --> IRQW
+    RM -- "I2C" --> DRV
+    RM -- "GP16" --> IRQ
 ```
 
-**Data path.** Each sensor on the node is sampled by its own Zephyr thread and published into a 256-byte register
-map. The base station burst-reads the first 76 bytes of that map once per second and decodes them through the
+**Data path.** Exact buses and pins are listed under [Hardware and wiring](#hardware-and-wiring). Each sensor on the
+node is sampled by its own Zephyr thread and published into a 256-byte register map. The base station burst-reads the first 76 bytes of that map once per second and decodes them through the
 standard Zephyr `sensor_channel_get()` API. When the node's object temperature rises above a base-station-configured
 threshold, the node latches an interrupt source bit and asserts its INT pin; the base station's GPIO callback fetches
 the map, triggers the alarm, and clears the interrupt over I2C.
@@ -225,16 +208,14 @@ cd embedded-fire-occupancy
 python3 -m venv .venv && source .venv/bin/activate
 pip install west
 west init -l .
-west update                       # full module set; see the filter below for a lighter checkout
+
+# Optional but recommended: only Zephyr, the RP2 HAL and CMSIS are needed for these boards.
+# Set this filter BEFORE the first `west update` to avoid downloading the full module set.
+west config manifest.project-filter -- "-.*,+zephyr,+hal_rpi_pico,+cmsis_6,+cmsis"
+
+west update
 west zephyr-export
 pip install -r zephyr/scripts/requirements.txt
-```
-
-Only Zephyr, the RP2 HAL and CMSIS are needed for these boards. To avoid downloading every module:
-
-```bash
-west config manifest.project-filter -- "-.*,+zephyr,+hal_rpi_pico,+cmsis_6,+cmsis"
-west update
 ```
 
 ### Build
@@ -285,13 +266,15 @@ build commands above to reproduce them rather than relying on the figures as-is.
 
 ## Known issues and limitations
 
-Each item below was confirmed by reading the source and is left **unfixed** in this fork so the original firmware is
-preserved as delivered. Line references are to the current `main`.
+Each item below comes from reading the source (item 1 also needs datasheet confirmation) and is left **unfixed** in
+this fork so the original firmware is preserved as delivered. Line references are to the current `main`.
 
-1. **BME680 gas-valid flag reads the wrong register.**
+1. **BME680 gas-valid flag may be read from the wrong register (source-review concern; verify against the datasheet).**
    [`bme680.c:347-378`](sensor_node/src/sensors/bme680/bme680.c#L347-L378) tests bits 5 and 4 of `meas_status_0`
-   (`0x1D`), but the Bosch datasheet places `gas_valid_r` and `heat_stab_r` in `gas_r_lsb` (`0x2B`, which is
-   `buf[14]` in the same 15-byte read). The `(warming)` indicator and `BME_GAS_VALID` are therefore unreliable.
+   (`0x1D`). In the Bosch register layout as understood during review, `gas_valid_r` and `heat_stab_r` live in
+   `gas_r_lsb` (`0x2B`, `buf[14]` of the same 15-byte read, the byte the code already uses for `gas_range`). If the
+   datasheet ([`datasheets/BME680.pdf`](datasheets/BME680.pdf)) confirms this, the `(warming)` indicator and
+   `BME_GAS_VALID` are unreliable. This has not been confirmed by datasheet text in this fork.
 2. **An alarm condition can be missed.** The `T_OBJ_HIGH` latch in
    [`register_map.c:197-213`](sensor_node/src/registers/register_map.c#L197-L213) is updated even while the bit is
    disabled in `INT_EN`. If the object temperature crosses the threshold during the base station's configuration
@@ -333,15 +316,18 @@ for this repository:
 
 ## Team and attribution
 
-This system was designed and built as a group project. Roles as stated in the project report:
+This system was designed and built as a group project. Roles are as stated in the project report unless marked:
 
 | Member | Role |
 |---|---|
 | Albin Kjellson | Zephyr driver and integration testing |
 | Dimitrios Angelos Bampos | Hardware integration and sensor validation |
 | Hoang Trung Dung Nguyen | Sensor node firmware |
-| Padmaja Pabbathi | Protocol design and documentation; also contributed to testing and to parts of the base-station alarm-check code |
+| Padmaja Pabbathi | Protocol design and documentation; testing and parts of the base-station alarm-check code\* |
 | Prithvi Vijay Lokhande | System evaluation and report preparation |
+
+\* Contributor-provided by the fork maintainer; the project report itself credits Padmaja Pabbathi with protocol design
+and documentation.
 
 The git history is preserved unchanged from upstream: the commits were authored by Hoang Trung Dung Nguyen
 (`TDung939`) and Albin Kjellson (`albinkj91`), and the five pull requests record the team's integration steps.
